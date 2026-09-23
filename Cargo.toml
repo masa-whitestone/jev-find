@@ -1,0 +1,30 @@
+[package]
+name = "jev-find"
+version = "0.1.0"
+edition = "2021"
+description = "AI-native find: search files in natural language, powered by Jev"
+license = "MIT"
+repository = "https://github.com/masa-whitestone/jev-find"
+readme = "README.md"
+keywords = ["find", "search", "cli", "ai", "semantic"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "jfd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+globset = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+rpassword = "7"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
