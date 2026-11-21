@@ -25,12 +25,43 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn squeeze_trims_and_collapses() {
+        assert_eq!(squeeze("a  \n\n\n\nb\t\n", false), "a\n\nb\n");
+        assert_eq!(squeeze("\n\nx", false), "x");
+        // 切れた最後の行は捨てる
+        assert_eq!(squeeze("line one\nline two\npart", true), "line one\nline two");
+    }
+
+    #[test]
+    fn split_paths_shares_dirs() {
+        let mut items = serde_json::Map::new();
+        items.insert("f0".into(), json!({"path": "src/a/x.rs", "size_bytes": 1}));
+        items.insert("f1".into(), json!({"path": "src/a/y.rs", "size_bytes": 2}));
+        items.insert("f2".into(), json!({"path": "top.rs", "size_bytes": 3}));
+        items.insert("f3".into(), json!({"path": "/etc", "size_bytes": 4}));
+        let dirs = split_paths(&mut items);
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(items["f0"]["dir"], items["f1"]["dir"]);
+        let d = |k: &str| dirs[items[k]["dir"].as_str().unwrap()].as_str().unwrap().to_string();
+        assert_eq!(d("f0"), "src/a");
+        assert_eq!(d("f2"), ".");
+        assert_eq!(d("f3"), "/");
+        assert_eq!(items["f1"]["name"], "y.rs");
+        assert_eq!(items["f1"]["size_bytes"], 2);
+        assert!(items["f1"].get("path").is_none());
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "jfd", version, about = "Semantic file finder powered by Jev")]
@@ -77,6 +108,15 @@ struct Args {
     /// Number of leading bytes sent to Jev in the content stage
     #[arg(short = 'H', long, default_value_t = 4096)]
     head_bytes: usize,
+    /// Content stage first looks at only this many bytes, and reads up to -H only when still undecided (0 = off)
+    #[arg(long, default_value_t = 1024)]
+    peek_bytes: usize,
+    /// Reject without reading further if the probability from the first --peek-bytes is at or below this
+    #[arg(long, default_value_t = 0.15)]
+    peek_reject: f64,
+    /// Accept without reading further if the probability from the first --peek-bytes is at or above this
+    #[arg(long, default_value_t = 0.9)]
+    peek_accept: f64,
     /// Only consider these extensions (mechanical filter, no API cost)
     #[arg(short = 'e', long = "ext")]
     exts: Vec<String>,
@@ -187,6 +227,9 @@ const HELP_JA: &[(&str, &str)] = &[
     ("deep_batch", "段階2(内容)で1リクエストにまとめるファイル数"),
     ("no_ignore", "既定で飛ばすディレクトリ(~/Library・node_modules・アプリバンドル・CACHEDIR.TAG のあるビルド出力)にも降りる"),
     ("head_bytes", "段階2でJevに渡す先頭バイト数"),
+    ("peek_bytes", "段階2ではまずこのバイト数だけ見せ、決めきれないときだけ -H まで読む(0で無効)"),
+    ("peek_reject", "先頭 --peek-bytes での確率がこれ以下なら、それ以上読まずに棄却"),
+    ("peek_accept", "先頭 --peek-bytes での確率がこれ以上なら、それ以上読まずに採用"),
     ("exts", "拡張子で事前に絞る(機械的フィルタ・API消費なし)"),
     ("excludes", "除外するglob(機械的フィルタ)"),
     ("hidden", "隠しファイル・ディレクトリも対象にする"),
@@ -235,6 +278,7 @@ struct Stats {
     files: AtomicU64,
     meta_decided: AtomicU64,
     deep: AtomicU64,
+    peek_decided: AtomicU64,
     errors: AtomicU64,
     blocked: AtomicU64,
 }
@@ -243,7 +287,7 @@ struct Ctx {
     args: Args,
     jev: jev::Client,
     cache: cache::Cache,
-    api: Semaphore,
+    api: Arc<Semaphore>,
     fsem: Semaphore,
     excludes: GlobSet,
     exts: Vec<String>,
@@ -266,8 +310,14 @@ impl std::fmt::Display for BudgetExhausted {
 impl std::error::Error for BudgetExhausted {}
 
 impl Ctx {
-    /// 1リクエストを送る(予算と同時実行数の管理つき)。キャッシュは judge 側で項目単位に持つ
-    async fn ask(&self, state: &Value, qs: &BTreeMap<String, Question>) -> Result<BTreeMap<String, Answer>> {
+    /// 1リクエストを送る(予算と同時実行数の管理つき)。キャッシュは judge 側で項目単位に持つ。
+    /// `permit` はバッチを組む前に取った同時実行枠(なければここで取る)
+    async fn ask(
+        &self,
+        state: &Value,
+        qs: &BTreeMap<String, Question>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<BTreeMap<String, Answer>> {
         if self.stopped() {
             return Err(BudgetExhausted.into());
         }
@@ -277,7 +327,10 @@ impl Ctx {
             self.stop.store(true, Relaxed);
             return Err(BudgetExhausted.into());
         }
-        let _permit = self.api.acquire().await?;
+        let _permit = match permit {
+            Some(p) => p,
+            None => self.api.clone().acquire_owned().await?,
+        };
         let (a, u) = self.jev.evaluate(state, qs).await?;
         self.st.in_tok.fetch_add(u.input_tokens, Relaxed);
         self.st.out_tok.fetch_add(u.output_tokens, Relaxed);
@@ -288,7 +341,9 @@ impl Ctx {
     async fn judge(&self, kind: Kind, item: Value) -> Result<BTreeMap<String, Answer>, Fail> {
         let qs: BTreeMap<String, Question> =
             questions(self, kind, "x").into_iter().map(|(k, q)| (k.to_string(), q)).collect();
-        let key = cache::Cache::key(&self.jev.model, &json!({ "query": self.args.query, "item": item }), &qs);
+        let mut st = shared_state(self, kind);
+        st.insert("item".into(), item.clone());
+        let key = cache::Cache::key(&self.jev.model, &Value::Object(st), &qs);
         if let Some(a) = self.cache.get(&key).await {
             self.st.cache_hits.fetch_add(1, Relaxed);
             return Ok(a);
@@ -336,11 +391,32 @@ enum Kind {
     Content,
 }
 
-fn match_criteria() -> Option<Value> {
-    Some(json!({
-        "true": "The file satisfies the query",
-        "false": "The file does not satisfy the query",
-    }))
+// トークン削減のため、判定の基準や前提は state の `task` に1リクエスト1回だけ書き、
+// 項目ごとの質問は「どの項目について問うか」だけの短い文にする。
+// (以前は同じ指示文と criteria を項目の数だけ繰り返しており、段階1の入力の6割強がそれだった)
+
+/// ファイルのパスは、バッチ内で共有するディレクトリ表 `dirs` と名前に分けて送る
+const PATH_RULE: &str = "A file's path is `dirs[<its dir>]` + \"/\" + `name`.";
+
+/// kind ごとの共通の指示(state の `task` に入れる)
+fn task(kind: Kind) -> String {
+    match kind {
+        Kind::Prune => "Each question asks about one entry of `directories`. Judging by its path and \
+             `sample_entries`, could that directory (anywhere beneath it) contain a file that satisfies `query`? \
+             true = plausibly contains matching files; false = clearly unrelated to the query, e.g. third-party \
+             dependencies, build output, caches, or assets irrelevant to it."
+            .into(),
+        Kind::Meta => format!(
+            "Each question asks about one entry of `files`. Judge only from its path and metadata: its content \
+             is NOT available, so stay uncertain if the name alone is not decisive. {PATH_RULE} \
+             For match questions: true = the file satisfies `query`; false = it does not."
+        ),
+        Kind::Content => format!(
+            "Each question asks about one entry of `files`. Judge from its path, metadata and `content_head` \
+             (the first bytes of the file; `content_truncated` says whether more follows). {PATH_RULE} \
+             For match questions: true = the file satisfies `query`; false = it does not."
+        ),
+    }
 }
 
 /// 項目 `id` について問う質問の一覧(キーは答えを取り出すときの名前)
@@ -348,36 +424,16 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
     match kind {
         Kind::Prune => vec![(
             "dir",
-            Question::Noul {
-                instructions: json!(format!(
-                    "Judging by the path and `sample_entries` of `directories.{id}`, could that directory \
-                     (anywhere beneath it) contain a file that satisfies `query`?"
-                )),
-                criteria: Some(json!({
-                    "true": "Plausibly contains matching files",
-                    "false": "Clearly unrelated to the query, e.g. third-party dependencies, build output, caches, or assets irrelevant to it",
-                })),
-            },
+            Question::Noul { instructions: json!(format!("Could `directories.{id}` contain a match?")), criteria: None },
         )],
         Kind::Meta => vec![(
             "match",
-            Question::Noul {
-                instructions: json!(format!(
-                    "Judging only from the path and metadata of `files.{id}` (its content is NOT available; \
-                     stay uncertain if the name alone is not decisive), does that file satisfy `query`?"
-                )),
-                criteria: match_criteria(),
-            },
+            Question::Noul { instructions: json!(format!("Does `files.{id}` satisfy `query`?")), criteria: None },
         )],
         Kind::Content => {
             let mut v = vec![(
                 "match",
-                Question::Noul {
-                    instructions: json!(format!(
-                        "Judging from the path, metadata and `content_head` of `files.{id}`, does that file satisfy `query`?"
-                    )),
-                    criteria: match_criteria(),
-                },
+                Question::Noul { instructions: json!(format!("Does `files.{id}` satisfy `query`?")), criteria: None },
             )];
             if !ctx.classify.is_empty() {
                 v.push((
@@ -388,11 +444,11 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
                     },
                 ));
             }
-            if let Some(r) = &ctx.args.rank {
+            if ctx.args.rank.is_some() {
                 v.push((
                     "rank",
                     Question::Score {
-                        instructions: json!({ "aspect": r, "question": format!("Rate `files.{id}` on `aspect`.") }),
+                        instructions: json!(format!("Rate `files.{id}` on `aspect`.")),
                         criteria: ctx.args.levels.iter().map(|s| json!(s)).collect(),
                     },
                 ));
@@ -400,6 +456,40 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
             v
         }
     }
+}
+
+/// state のうち、項目によらない部分(`query` と `task`、--rank の観点)
+fn shared_state(ctx: &Ctx, kind: Kind) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("query".into(), json!(ctx.args.query));
+    m.insert("task".into(), json!(task(kind)));
+    if let (Kind::Content, Some(r)) = (kind, &ctx.args.rank) {
+        m.insert("aspect".into(), json!(r));
+    }
+    m
+}
+
+/// ファイル項目の "path" を、バッチ内で共有するディレクトリ表への参照 "dir" と "name" に分ける
+fn split_paths(items: &mut serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut dirs = serde_json::Map::new();
+    for item in items.values_mut() {
+        let Some(m) = item.as_object_mut() else { continue };
+        let Some(Value::String(path)) = m.remove("path") else { continue };
+        let (dir, name) = path.rsplit_once('/').unwrap_or((".", &path));
+        let dir = if dir.is_empty() { "/" } else { dir };
+        let id = ids.entry(dir.to_string()).or_insert_with(|| {
+            let id = format!("p{}", dirs.len());
+            dirs.insert(id.clone(), json!(dir));
+            id
+        });
+        let mut out = serde_json::Map::new();
+        out.insert("dir".into(), json!(id));
+        out.insert("name".into(), json!(name));
+        out.extend(std::mem::take(m));
+        *m = out;
+    }
+    dirs
 }
 
 fn noul(a: Option<&Answer>) -> f64 {
@@ -444,14 +534,32 @@ impl Pools {
     }
 }
 
-/// 最初の1件が来てから最大 30ms、または size 件たまるまで待って1バッチにする
+/// バッチを組むときに、次の1件をこれ以上待たない間隔
+const BATCH_IDLE: Duration = Duration::from_millis(3);
+/// 最初の1件から送信までの最長の待ち
+const BATCH_LINGER: Duration = Duration::from_millis(30);
+
+/// 適応的なバッチ化:
+/// - 先に API の同時実行枠を取ってからバッチを組む。枠が埋まっている間は項目が列にたまり、
+///   空いた瞬間にまとめて大きなバッチで送る(混んでいるほどバッチが大きくなる)
+/// - 枠が空いていれば、項目の流れが BATCH_IDLE 途切れた時点ですぐ送る(固定の待ち時間を払わない)
 async fn run_pool(ctx: Arc<Ctx>, kind: Kind, mut rx: mpsc::Receiver<Job>, size: usize) {
     let size = size.max(1);
     while let Some(j) = rx.recv().await {
+        let Ok(permit) = ctx.api.clone().acquire_owned().await else { return };
         let mut batch = vec![j];
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let deadline = tokio::time::Instant::now() + BATCH_LINGER;
         while batch.len() < size {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
+            match rx.try_recv() {
+                Ok(j) => {
+                    batch.push(j);
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            let idle = (tokio::time::Instant::now() + BATCH_IDLE).min(deadline);
+            match tokio::time::timeout_at(idle, rx.recv()).await {
                 Ok(Some(j)) => batch.push(j),
                 _ => break,
             }
@@ -459,7 +567,7 @@ async fn run_pool(ctx: Arc<Ctx>, kind: Kind, mut rx: mpsc::Receiver<Job>, size: 
         if ctx.stopped() {
             continue; // reply を落とすと待ち手には Fail::Failed が返る
         }
-        tokio::spawn(run_batch(ctx.clone(), kind, batch));
+        tokio::spawn(run_batch(ctx.clone(), kind, batch, Some(permit)));
     }
 }
 
@@ -468,11 +576,11 @@ fn splittable(e: &anyhow::Error) -> bool {
     s.contains("max_tokens_exceeded") || s.starts_with("HTTP 403") || s.starts_with("HTTP 413")
 }
 
-fn run_batch(ctx: Arc<Ctx>, kind: Kind, batch: Vec<Job>) -> BoxFut {
-    Box::pin(run_batch_inner(ctx, kind, batch))
+fn run_batch(ctx: Arc<Ctx>, kind: Kind, batch: Vec<Job>, permit: Option<OwnedSemaphorePermit>) -> BoxFut {
+    Box::pin(run_batch_inner(ctx, kind, batch, permit))
 }
 
-async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
+async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>, permit: Option<OwnedSemaphorePermit>) {
     let (coll, prefix) = match kind {
         Kind::Prune => ("directories", "d"),
         Kind::Meta | Kind::Content => ("files", "f"),
@@ -486,15 +594,20 @@ async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
         }
         items.insert(id, j.item.clone());
     }
-    let state = json!({ "query": ctx.args.query, coll: items });
-    let mut answers = match ctx.ask(&state, &qs).await {
+    let mut state = shared_state(&ctx, kind);
+    if !matches!(kind, Kind::Prune) {
+        state.insert("dirs".into(), Value::Object(split_paths(&mut items)));
+    }
+    state.insert(coll.into(), Value::Object(items));
+    let state = Value::Object(state);
+    let mut answers = match ctx.ask(&state, &qs, permit).await {
         Ok(a) => a,
         // トークン上限超過やファイアウォールのブロック(特定ファイルの内容が原因)は、
         // 半分に割って送り直す。原因の1件だけが最後に落ちる
         Err(e) if batch.len() > 1 && splittable(&e) => {
             let second = batch.split_off(batch.len() / 2);
-            tokio::spawn(run_batch(ctx.clone(), kind, second));
-            return run_batch(ctx, kind, batch).await;
+            tokio::spawn(run_batch(ctx.clone(), kind, second, None));
+            return run_batch(ctx, kind, batch, None).await;
         }
         // 1件まで絞っても遮断される → そのファイルの内容が原因。呼び出し側で名前だけの判定に切り替える
         Err(e) if format!("{e:#}").starts_with("HTTP 403") => {
@@ -511,14 +624,17 @@ async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
             return ctx.report(&what, e);
         }
     };
-    for (i, j) in batch.into_iter().enumerate() {
-        let pre = format!("{prefix}{i}_");
-        let keys: Vec<String> = answers.keys().filter(|k| k.starts_with(&pre)).cloned().collect();
-        let mine: BTreeMap<String, Answer> = keys
-            .into_iter()
-            .filter_map(|k| answers.remove(&k).map(|a| (k[pre.len()..].to_string(), a)))
-            .collect();
-        ctx.cache.put(&j.key, &mine).await;
+    // 答えのキーは "{id}_{質問名}"。id ごとに振り分ける
+    let mut per: Vec<BTreeMap<String, Answer>> = (0..batch.len()).map(|_| BTreeMap::new()).collect();
+    for (k, a) in std::mem::take(&mut answers) {
+        let Some((id, q)) = k.split_once('_') else { continue };
+        let Some(i) = id.strip_prefix(prefix).and_then(|n| n.parse::<usize>().ok()) else { continue };
+        if let Some(m) = per.get_mut(i) {
+            m.insert(q.to_string(), a);
+        }
+    }
+    ctx.cache.put_many(batch.iter().zip(&per).map(|(j, m)| (j.key.as_str(), m))).await;
+    for (j, mine) in batch.into_iter().zip(per) {
         let _ = j.reply.send(Ok(mine));
     }
 }
@@ -572,9 +688,27 @@ fn age_days(now: u64, mtime: u64) -> f64 {
     (now.saturating_sub(mtime) as f64 / 86400.0 * 10.0).round() / 10.0
 }
 
-fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) -> BoxFut {
+/// 枝刈りの判定結果を待つための札。None = 判定待ち、Some(true) = 降りてよい
+type Gate = watch::Receiver<Option<bool>>;
+
+fn open_gate() -> Gate {
+    watch::channel(Some(true)).1
+}
+
+/// 判定が出るまで待つ。判定役がいなくなったら降りる側に倒す (fail-open)
+async fn pass(g: &mut Gate) -> bool {
+    match g.wait_for(|v| v.is_some()).await {
+        Ok(v) => v.unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// `parent` は親ディレクトリの枝刈り判定。親の判定を待たずに自分の一覧と枝刈りの問い合わせを
+/// 先に始め(1段だけ先読み)、親が「降りない」と決めたらそこで捨てる。
+/// 深い木でも「1段ごとに API の往復を1回待つ」直列の連鎖にならない
+fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>, mut parent: Gate) -> BoxFut {
     Box::pin(async move {
-        if ctx.stopped() {
+        if ctx.stopped() || *parent.borrow() == Some(false) {
             return;
         }
         let listing = {
@@ -599,33 +733,43 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
             ctx.st.ignored.fetch_add(1, Relaxed);
             return;
         }
-        ctx.st.dirs.fetch_add(1, Relaxed);
 
-        // 意味的枝刈り: 読んだ一覧をそのまま使う(追加のI/Oなし)
-        if ctx.args.prune && depth >= ctx.args.prune_min_depth {
+        // 意味的枝刈り: 読んだ一覧をそのまま使う(追加のI/Oなし)。答えは待たずに先へ進む
+        let mut gate = if ctx.args.prune && depth >= ctx.args.prune_min_depth {
             let sample: Vec<String> = listing
                 .iter()
                 .take(60)
                 .map(|e| if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })
                 .collect();
             let item = json!({ "path": show(&dir), "entry_count": listing.len(), "sample_entries": sample });
-            match ctx.judge(Kind::Prune, item).await {
-                Ok(a) => {
-                    let p = noul(a.get("dir"));
-                    if p < ctx.args.prune_threshold {
-                        ctx.st.pruned.fetch_add(1, Relaxed);
-                        if ctx.args.verbose {
-                            eprintln!("jfd: prune {:.2} {}", p, show(&dir));
+            let (tx, rx) = watch::channel(None);
+            let c = ctx.clone();
+            let d = dir.clone();
+            tokio::spawn(async move {
+                let keep = match c.judge(Kind::Prune, item).await {
+                    Ok(a) => {
+                        let p = noul(a.get("dir"));
+                        if p < c.args.prune_threshold && c.args.verbose {
+                            eprintln!("jfd: prune {:.2} {}", p, show(&d));
                         }
-                        return;
+                        p >= c.args.prune_threshold
                     }
-                }
-                Err(_) if ctx.stopped() => return,
-                Err(_) => {} // fail-open: 判定できなければ降りる
-            }
+                    Err(_) => !c.stopped(), // fail-open: 判定できなければ降りる
+                };
+                tx.send_replace(Some(keep));
+            });
+            rx
+        } else {
+            open_gate()
+        };
+
+        // 親が降りると決めるまでは子に手を付けない(先読みは1段だけ)
+        if !pass(&mut parent).await {
+            return;
         }
 
-        let mut files = JoinSet::new();
+        let mut subdirs = Vec::new();
+        let mut files_here = Vec::new();
         for e in listing {
             if !ctx.args.hidden && e.name.starts_with('.') {
                 continue;
@@ -638,7 +782,7 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
                 if ctx.ignored_dir(&path, &e.name) {
                     ctx.st.ignored.fetch_add(1, Relaxed);
                 } else if ctx.args.max_depth.map_or(true, |m| depth + 1 < m) {
-                    tokio::spawn(walk_dir(ctx.clone(), path, depth + 1, hits.clone()));
+                    subdirs.push(path);
                 }
             } else if e.is_file {
                 if !ctx.exts.is_empty() {
@@ -653,9 +797,23 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
                 if ctx.args.max_size.is_some_and(|m| e.size > m) {
                     continue;
                 }
-                let f = FileEntry { path, size: e.size, mtime: e.mtime };
-                files.spawn(eval_file(ctx.clone(), f, hits.clone()));
+                files_here.push(FileEntry { path, size: e.size, mtime: e.mtime });
             }
+        }
+        // 子ディレクトリは自分の判定を待たずに走らせる(子は自分の判定が出るまでファイルに手を付けない)
+        for path in subdirs {
+            tokio::spawn(walk_dir(ctx.clone(), path, depth + 1, hits.clone(), gate.clone()));
+        }
+        if !pass(&mut gate).await {
+            if !ctx.stopped() {
+                ctx.st.pruned.fetch_add(1, Relaxed);
+            }
+            return;
+        }
+        ctx.st.dirs.fetch_add(1, Relaxed);
+        let mut files = JoinSet::new();
+        for f in files_here {
+            files.spawn(eval_file(ctx.clone(), f, hits.clone()));
         }
         while files.join_next().await.is_some() {}
     })
@@ -680,14 +838,61 @@ struct Hit {
     level: Option<String>,
 }
 
-async fn read_head(p: &Path, n: usize) -> Result<(String, bool, bool)> {
-    let f = tokio::fs::File::open(p).await?;
+/// tokio::fs だと open と read のたびにスレッドプールを往復するので、1回の spawn_blocking で済ませる。
+/// 返り値は (先頭 n バイト, n バイトより後ろがあるか, バイナリか)
+async fn read_head(p: &Path, n: usize) -> Result<(Vec<u8>, bool, bool)> {
+    let p = p.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || read_head_sync(&p, n)).await??)
+}
+
+fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(Vec<u8>, bool, bool)> {
+    use std::io::Read;
+    let f = std::fs::File::open(p)?;
     let mut buf = Vec::with_capacity(n.min(1 << 20) + 1);
-    f.take(n as u64 + 1).read_to_end(&mut buf).await?;
+    f.take(n as u64 + 1).read_to_end(&mut buf)?;
     let truncated = buf.len() > n;
     buf.truncate(n);
     let binary = buf.iter().take(8192).any(|&b| b == 0);
-    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated, binary))
+    Ok((buf, truncated, binary))
+}
+
+/// 先頭 `n` バイトを見せる項目を作る。`more` = ファイル全体で `n` バイトより後ろがあるか
+fn with_content(item: &Value, buf: &[u8], n: usize, more: bool) -> Value {
+    let n = n.min(buf.len());
+    let truncated = more || n < buf.len();
+    let mut item = item.clone();
+    let m = item.as_object_mut().expect("object");
+    m.insert("content_head".into(), json!(squeeze(&String::from_utf8_lossy(&buf[..n]), truncated)));
+    m.insert("content_truncated".into(), json!(truncated));
+    item
+}
+
+/// 意味を変えずにトークンを減らす: 行末の空白を落とし、連続する空行は1行にまとめ、
+/// 途中で切れた最後の行は捨てる(切れた単語や壊れた文字は判定の役に立たない)
+fn squeeze(text: &str, truncated: bool) -> String {
+    let body = match text.rfind('\n') {
+        Some(i) if truncated && i >= text.len() / 2 => &text[..i],
+        _ => text,
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut blank = false;
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if blank || out.is_empty() {
+                continue;
+            }
+            blank = true;
+        } else {
+            blank = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
@@ -723,23 +928,56 @@ async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
         let _p = ctx.fsem.acquire().await.expect("semaphore");
         read_head(&f.path, ctx.args.head_bytes).await
     };
-    let (head, truncated, binary) = match read {
+    let (buf, more, binary) = match read {
         Ok(v) => v,
         Err(e) => return ctx.report(&path, e),
     };
     let meta_item = item.clone();
-    let m = item.as_object_mut().expect("object");
     if binary {
-        m.insert("content".into(), json!("(binary file; content omitted)"));
-    } else {
-        m.insert("content_head".into(), json!(head));
-        m.insert("content_truncated".into(), json!(truncated));
+        item.as_object_mut()
+            .expect("object")
+            .insert("content".into(), json!("(binary file; content omitted)"));
     }
-    let a = match ctx.judge(Kind::Content, item).await {
+
+    // 段階2a: まず先頭 --peek-bytes だけで問う。多くのファイルはこれで決まり、-H まで読ませる分のトークンを払わずに済む
+    let peek = ctx.args.peek_bytes;
+    let mut peeked = None;
+    if !binary && peek > 0 && buf.len() > peek {
+        match ctx.judge(Kind::Content, with_content(&item, &buf, peek, more)).await {
+            Ok(a) => {
+                let p = noul(a.get("match"));
+                if p <= ctx.args.peek_reject {
+                    ctx.st.peek_decided.fetch_add(1, Relaxed);
+                    return;
+                }
+                if p >= ctx.args.peek_accept {
+                    ctx.st.peek_decided.fetch_add(1, Relaxed);
+                    return emit_content(&ctx, path, &a, "peek", &hits).await;
+                }
+                peeked = Some(a);
+            }
+            // 一部で遮断されるなら全体でも遮断される
+            Err(Fail::Blocked) => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+            Err(Fail::Failed) => return,
+        }
+    }
+
+    // 段階2b: -H バイトまで見せて問う
+    let full = if binary { item } else { with_content(&item, &buf, buf.len(), more) };
+    let a = match ctx.judge(Kind::Content, full).await {
         Ok(a) => a,
-        Err(Fail::Blocked) => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+        // 後半で遮断されたら、先頭だけで出た答えで代用する
+        Err(Fail::Blocked) => match peeked {
+            Some(a) => a,
+            None => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+        },
         Err(Fail::Failed) => return,
     };
+    emit_content(&ctx, path, &a, "content", &hits).await
+}
+
+/// 段階2の答えから結果を出す(しきい値未満なら何もしない)
+async fn emit_content(ctx: &Ctx, path: String, a: &BTreeMap<String, Answer>, stage: &'static str, hits: &mpsc::Sender<Hit>) {
     let p = noul(a.get("match"));
     if p < ctx.args.threshold {
         return;
@@ -757,7 +995,7 @@ async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
         }
         _ => (None, None),
     };
-    let _ = hits.send(Hit { path, prob: p, stage: "content", label, label_confidence, score, level }).await;
+    let _ = hits.send(Hit { path, prob: p, stage, label, label_confidence, score, level }).await;
 }
 
 /// 内容がファイアウォールに遮断されたファイルは、名前とメタデータだけの判定で代用する
@@ -882,10 +1120,12 @@ async fn main() -> Result<()> {
     let (prune_tx, prune_rx) = mpsc::channel(8192);
     let (meta_tx, meta_rx) = mpsc::channel(8192);
     let (content_tx, content_rx) = mpsc::channel(8192);
+    let started = Instant::now();
+    let jev = jev::Client::new(&base_url, key, model)?;
     let ctx = Arc::new(Ctx {
-        jev: jev::Client::new(&base_url, key, model)?,
+        jev,
         cache: cache::Cache::new(!args.no_cache),
-        api: Semaphore::new(jobs),
+        api: Arc::new(Semaphore::new(jobs)),
         fsem: Semaphore::new(128),
         excludes: gb.build()?,
         exts: args.exts.iter().map(|e| e.trim_start_matches('.').to_string()).collect(),
@@ -909,7 +1149,7 @@ async fn main() -> Result<()> {
             let mtime = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
             tokio::spawn(eval_file(ctx.clone(), FileEntry { path: root, size: md.len(), mtime }, hit_tx.clone()));
         } else {
-            tokio::spawn(walk_dir(ctx.clone(), root, 0, hit_tx.clone()));
+            tokio::spawn(walk_dir(ctx.clone(), root, 0, hit_tx.clone(), open_gate()));
         }
     }
     drop(hit_tx); // 全ウォーカーとファイル判定が終わると hit_rx が閉じる
@@ -938,11 +1178,13 @@ async fn main() -> Result<()> {
     if ctx.args.stats {
         let tin = s.in_tok.load(Relaxed);
         eprintln!(
-            "dirs={} pruned={} ignored={} denied={} files={} meta_decided={} deep={} blocked={} requests={} cache_hits={} errors={}",
+            "dirs={} pruned={} ignored={} denied={} files={} meta_decided={} deep={} peek_decided={} blocked={} requests={} cache_hits={} errors={}",
             s.dirs.load(Relaxed), s.pruned.load(Relaxed), s.ignored.load(Relaxed), denied,
-            s.files.load(Relaxed), s.meta_decided.load(Relaxed), s.deep.load(Relaxed), s.blocked.load(Relaxed),
+            s.files.load(Relaxed), s.meta_decided.load(Relaxed), s.deep.load(Relaxed), s.peek_decided.load(Relaxed),
+            s.blocked.load(Relaxed),
             s.requests.load(Relaxed), s.cache_hits.load(Relaxed), s.errors.load(Relaxed),
         );
+        eprintln!("elapsed={:.3}s", started.elapsed().as_secs_f64());
         eprintln!(
             "tokens in={} out={}  est. cost ≈ ${:.5} (at $0.042 / 1M input tokens)",
             tin, s.out_tok.load(Relaxed), tin as f64 * 0.042 / 1e6

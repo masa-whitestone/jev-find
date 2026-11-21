@@ -72,11 +72,15 @@ Files whose content is blocked by the API's firewall are judged by name and meta
 
 1. A parallel walker lists files (with `--prune`, Jev decides per directory whether to descend)
 2. Stage 1: judge by path, size and age only (cheap, content not read)
-3. Stage 2: only undecided files have their first few KB read; classification (`-c`) and scoring (`--rank`) are asked in the same request
+3. Stage 2: only undecided files have their first few KB read; classification (`-c`) and scoring (`--rank`) are asked in the same request.
+   Jev first sees only the first 1KB (`--peek-bytes`); a file is sent again with up to `-H` bytes only when that is not decisive (`--peek-reject` / `--peek-accept`). Results decided this way have `"stage": "peek"` in `--json`.
+   Requests share the judging rules once per request and send each directory prefix once per batch, to keep token use down.
 
 Questions are batched across directories: up to 64 files per request in stage 1 (`--batch`) and 16 in stage 2 (`--deep-batch`). Batches that exceed the token limit are split in half and retried automatically.
+Batching is adaptive: a batch is sent as soon as the stream of files pauses for a few milliseconds (no fixed wait), and while all `-j` request slots are busy, files pile up and go out together in larger batches once a slot frees.
+With `--prune`, a directory's listing and pruning question start without waiting for its parent's answer (one level of lookahead), so deep trees do not pay one API round trip per level.
 
-Answers are cached per file in `~/.cache/jfd/` and invalidated when a file changes, so a run stopped by `--budget N` (request limit) resumes where it left off. `--stats` prints tokens used and an estimated cost.
+Answers are cached per file in a single append-only log under `~/.cache/jfd/`, loaded in the background at startup, and invalidated when a file changes, so a run stopped by `--budget N` (request limit) resumes where it left off. `--stats` prints tokens used and an estimated cost.
 
 `--rank` scores range from 0 (lowest level) to 1 (highest level) and show the nearest level name.
 
