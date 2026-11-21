@@ -108,6 +108,15 @@ struct Args {
     /// Number of leading bytes sent to Jev in the content stage
     #[arg(short = 'H', long, default_value_t = 4096)]
     head_bytes: usize,
+    /// Content stage first looks at only this many bytes, and reads up to -H only when still undecided (0 = off)
+    #[arg(long, default_value_t = 1024)]
+    peek_bytes: usize,
+    /// Reject without reading further if the probability from the first --peek-bytes is at or below this
+    #[arg(long, default_value_t = 0.15)]
+    peek_reject: f64,
+    /// Accept without reading further if the probability from the first --peek-bytes is at or above this
+    #[arg(long, default_value_t = 0.9)]
+    peek_accept: f64,
     /// Only consider these extensions (mechanical filter, no API cost)
     #[arg(short = 'e', long = "ext")]
     exts: Vec<String>,
@@ -218,6 +227,9 @@ const HELP_JA: &[(&str, &str)] = &[
     ("deep_batch", "段階2(内容)で1リクエストにまとめるファイル数"),
     ("no_ignore", "既定で飛ばすディレクトリ(~/Library・node_modules・アプリバンドル・CACHEDIR.TAG のあるビルド出力)にも降りる"),
     ("head_bytes", "段階2でJevに渡す先頭バイト数"),
+    ("peek_bytes", "段階2ではまずこのバイト数だけ見せ、決めきれないときだけ -H まで読む(0で無効)"),
+    ("peek_reject", "先頭 --peek-bytes での確率がこれ以下なら、それ以上読まずに棄却"),
+    ("peek_accept", "先頭 --peek-bytes での確率がこれ以上なら、それ以上読まずに採用"),
     ("exts", "拡張子で事前に絞る(機械的フィルタ・API消費なし)"),
     ("excludes", "除外するglob(機械的フィルタ)"),
     ("hidden", "隠しファイル・ディレクトリも対象にする"),
@@ -266,6 +278,7 @@ struct Stats {
     files: AtomicU64,
     meta_decided: AtomicU64,
     deep: AtomicU64,
+    peek_decided: AtomicU64,
     errors: AtomicU64,
     blocked: AtomicU64,
 }
@@ -825,13 +838,14 @@ struct Hit {
     level: Option<String>,
 }
 
-/// tokio::fs だと open と read のたびにスレッドプールを往復するので、1回の spawn_blocking で済ませる
-async fn read_head(p: &Path, n: usize) -> Result<(String, bool, bool)> {
+/// tokio::fs だと open と read のたびにスレッドプールを往復するので、1回の spawn_blocking で済ませる。
+/// 返り値は (先頭 n バイト, n バイトより後ろがあるか, バイナリか)
+async fn read_head(p: &Path, n: usize) -> Result<(Vec<u8>, bool, bool)> {
     let p = p.to_path_buf();
     Ok(tokio::task::spawn_blocking(move || read_head_sync(&p, n)).await??)
 }
 
-fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(String, bool, bool)> {
+fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(Vec<u8>, bool, bool)> {
     use std::io::Read;
     let f = std::fs::File::open(p)?;
     let mut buf = Vec::with_capacity(n.min(1 << 20) + 1);
@@ -839,8 +853,18 @@ fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(String, bool, bool)> {
     let truncated = buf.len() > n;
     buf.truncate(n);
     let binary = buf.iter().take(8192).any(|&b| b == 0);
-    let text = if binary { String::new() } else { squeeze(&String::from_utf8_lossy(&buf), truncated) };
-    Ok((text, truncated, binary))
+    Ok((buf, truncated, binary))
+}
+
+/// 先頭 `n` バイトを見せる項目を作る。`more` = ファイル全体で `n` バイトより後ろがあるか
+fn with_content(item: &Value, buf: &[u8], n: usize, more: bool) -> Value {
+    let n = n.min(buf.len());
+    let truncated = more || n < buf.len();
+    let mut item = item.clone();
+    let m = item.as_object_mut().expect("object");
+    m.insert("content_head".into(), json!(squeeze(&String::from_utf8_lossy(&buf[..n]), truncated)));
+    m.insert("content_truncated".into(), json!(truncated));
+    item
 }
 
 /// 意味を変えずにトークンを減らす: 行末の空白を落とし、連続する空行は1行にまとめ、
@@ -904,23 +928,56 @@ async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
         let _p = ctx.fsem.acquire().await.expect("semaphore");
         read_head(&f.path, ctx.args.head_bytes).await
     };
-    let (head, truncated, binary) = match read {
+    let (buf, more, binary) = match read {
         Ok(v) => v,
         Err(e) => return ctx.report(&path, e),
     };
     let meta_item = item.clone();
-    let m = item.as_object_mut().expect("object");
     if binary {
-        m.insert("content".into(), json!("(binary file; content omitted)"));
-    } else {
-        m.insert("content_head".into(), json!(head));
-        m.insert("content_truncated".into(), json!(truncated));
+        item.as_object_mut()
+            .expect("object")
+            .insert("content".into(), json!("(binary file; content omitted)"));
     }
-    let a = match ctx.judge(Kind::Content, item).await {
+
+    // 段階2a: まず先頭 --peek-bytes だけで問う。多くのファイルはこれで決まり、-H まで読ませる分のトークンを払わずに済む
+    let peek = ctx.args.peek_bytes;
+    let mut peeked = None;
+    if !binary && peek > 0 && buf.len() > peek {
+        match ctx.judge(Kind::Content, with_content(&item, &buf, peek, more)).await {
+            Ok(a) => {
+                let p = noul(a.get("match"));
+                if p <= ctx.args.peek_reject {
+                    ctx.st.peek_decided.fetch_add(1, Relaxed);
+                    return;
+                }
+                if p >= ctx.args.peek_accept {
+                    ctx.st.peek_decided.fetch_add(1, Relaxed);
+                    return emit_content(&ctx, path, &a, "peek", &hits).await;
+                }
+                peeked = Some(a);
+            }
+            // 一部で遮断されるなら全体でも遮断される
+            Err(Fail::Blocked) => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+            Err(Fail::Failed) => return,
+        }
+    }
+
+    // 段階2b: -H バイトまで見せて問う
+    let full = if binary { item } else { with_content(&item, &buf, buf.len(), more) };
+    let a = match ctx.judge(Kind::Content, full).await {
         Ok(a) => a,
-        Err(Fail::Blocked) => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+        // 後半で遮断されたら、先頭だけで出た答えで代用する
+        Err(Fail::Blocked) => match peeked {
+            Some(a) => a,
+            None => return eval_blocked(&ctx, path, meta_item, meta_p, &hits).await,
+        },
         Err(Fail::Failed) => return,
     };
+    emit_content(&ctx, path, &a, "content", &hits).await
+}
+
+/// 段階2の答えから結果を出す(しきい値未満なら何もしない)
+async fn emit_content(ctx: &Ctx, path: String, a: &BTreeMap<String, Answer>, stage: &'static str, hits: &mpsc::Sender<Hit>) {
     let p = noul(a.get("match"));
     if p < ctx.args.threshold {
         return;
@@ -938,7 +995,7 @@ async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
         }
         _ => (None, None),
     };
-    let _ = hits.send(Hit { path, prob: p, stage: "content", label, label_confidence, score, level }).await;
+    let _ = hits.send(Hit { path, prob: p, stage, label, label_confidence, score, level }).await;
 }
 
 /// 内容がファイアウォールに遮断されたファイルは、名前とメタデータだけの判定で代用する
@@ -1121,9 +1178,10 @@ async fn main() -> Result<()> {
     if ctx.args.stats {
         let tin = s.in_tok.load(Relaxed);
         eprintln!(
-            "dirs={} pruned={} ignored={} denied={} files={} meta_decided={} deep={} blocked={} requests={} cache_hits={} errors={}",
+            "dirs={} pruned={} ignored={} denied={} files={} meta_decided={} deep={} peek_decided={} blocked={} requests={} cache_hits={} errors={}",
             s.dirs.load(Relaxed), s.pruned.load(Relaxed), s.ignored.load(Relaxed), denied,
-            s.files.load(Relaxed), s.meta_decided.load(Relaxed), s.deep.load(Relaxed), s.blocked.load(Relaxed),
+            s.files.load(Relaxed), s.meta_decided.load(Relaxed), s.deep.load(Relaxed), s.peek_decided.load(Relaxed),
+            s.blocked.load(Relaxed),
             s.requests.load(Relaxed), s.cache_hits.load(Relaxed), s.errors.load(Relaxed),
         );
         eprintln!("elapsed={:.3}s", started.elapsed().as_secs_f64());
