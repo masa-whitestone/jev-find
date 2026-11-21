@@ -31,6 +31,38 @@ use tokio::task::JoinSet;
 
 type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn squeeze_trims_and_collapses() {
+        assert_eq!(squeeze("a  \n\n\n\nb\t\n", false), "a\n\nb\n");
+        assert_eq!(squeeze("\n\nx", false), "x");
+        // 切れた最後の行は捨てる
+        assert_eq!(squeeze("line one\nline two\npart", true), "line one\nline two");
+    }
+
+    #[test]
+    fn split_paths_shares_dirs() {
+        let mut items = serde_json::Map::new();
+        items.insert("f0".into(), json!({"path": "src/a/x.rs", "size_bytes": 1}));
+        items.insert("f1".into(), json!({"path": "src/a/y.rs", "size_bytes": 2}));
+        items.insert("f2".into(), json!({"path": "top.rs", "size_bytes": 3}));
+        items.insert("f3".into(), json!({"path": "/etc", "size_bytes": 4}));
+        let dirs = split_paths(&mut items);
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(items["f0"]["dir"], items["f1"]["dir"]);
+        let d = |k: &str| dirs[items[k]["dir"].as_str().unwrap()].as_str().unwrap().to_string();
+        assert_eq!(d("f0"), "src/a");
+        assert_eq!(d("f2"), ".");
+        assert_eq!(d("f3"), "/");
+        assert_eq!(items["f1"]["name"], "y.rs");
+        assert_eq!(items["f1"]["size_bytes"], 2);
+        assert!(items["f1"].get("path").is_none());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "jfd", version, about = "Semantic file finder powered by Jev")]
 struct Args {
@@ -296,7 +328,9 @@ impl Ctx {
     async fn judge(&self, kind: Kind, item: Value) -> Result<BTreeMap<String, Answer>, Fail> {
         let qs: BTreeMap<String, Question> =
             questions(self, kind, "x").into_iter().map(|(k, q)| (k.to_string(), q)).collect();
-        let key = cache::Cache::key(&self.jev.model, &json!({ "query": self.args.query, "item": item }), &qs);
+        let mut st = shared_state(self, kind);
+        st.insert("item".into(), item.clone());
+        let key = cache::Cache::key(&self.jev.model, &Value::Object(st), &qs);
         if let Some(a) = self.cache.get(&key).await {
             self.st.cache_hits.fetch_add(1, Relaxed);
             return Ok(a);
@@ -344,11 +378,32 @@ enum Kind {
     Content,
 }
 
-fn match_criteria() -> Option<Value> {
-    Some(json!({
-        "true": "The file satisfies the query",
-        "false": "The file does not satisfy the query",
-    }))
+// トークン削減のため、判定の基準や前提は state の `task` に1リクエスト1回だけ書き、
+// 項目ごとの質問は「どの項目について問うか」だけの短い文にする。
+// (以前は同じ指示文と criteria を項目の数だけ繰り返しており、段階1の入力の6割強がそれだった)
+
+/// ファイルのパスは、バッチ内で共有するディレクトリ表 `dirs` と名前に分けて送る
+const PATH_RULE: &str = "A file's path is `dirs[<its dir>]` + \"/\" + `name`.";
+
+/// kind ごとの共通の指示(state の `task` に入れる)
+fn task(kind: Kind) -> String {
+    match kind {
+        Kind::Prune => "Each question asks about one entry of `directories`. Judging by its path and \
+             `sample_entries`, could that directory (anywhere beneath it) contain a file that satisfies `query`? \
+             true = plausibly contains matching files; false = clearly unrelated to the query, e.g. third-party \
+             dependencies, build output, caches, or assets irrelevant to it."
+            .into(),
+        Kind::Meta => format!(
+            "Each question asks about one entry of `files`. Judge only from its path and metadata: its content \
+             is NOT available, so stay uncertain if the name alone is not decisive. {PATH_RULE} \
+             For match questions: true = the file satisfies `query`; false = it does not."
+        ),
+        Kind::Content => format!(
+            "Each question asks about one entry of `files`. Judge from its path, metadata and `content_head` \
+             (the first bytes of the file; `content_truncated` says whether more follows). {PATH_RULE} \
+             For match questions: true = the file satisfies `query`; false = it does not."
+        ),
+    }
 }
 
 /// 項目 `id` について問う質問の一覧(キーは答えを取り出すときの名前)
@@ -356,36 +411,16 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
     match kind {
         Kind::Prune => vec![(
             "dir",
-            Question::Noul {
-                instructions: json!(format!(
-                    "Judging by the path and `sample_entries` of `directories.{id}`, could that directory \
-                     (anywhere beneath it) contain a file that satisfies `query`?"
-                )),
-                criteria: Some(json!({
-                    "true": "Plausibly contains matching files",
-                    "false": "Clearly unrelated to the query, e.g. third-party dependencies, build output, caches, or assets irrelevant to it",
-                })),
-            },
+            Question::Noul { instructions: json!(format!("Could `directories.{id}` contain a match?")), criteria: None },
         )],
         Kind::Meta => vec![(
             "match",
-            Question::Noul {
-                instructions: json!(format!(
-                    "Judging only from the path and metadata of `files.{id}` (its content is NOT available; \
-                     stay uncertain if the name alone is not decisive), does that file satisfy `query`?"
-                )),
-                criteria: match_criteria(),
-            },
+            Question::Noul { instructions: json!(format!("Does `files.{id}` satisfy `query`?")), criteria: None },
         )],
         Kind::Content => {
             let mut v = vec![(
                 "match",
-                Question::Noul {
-                    instructions: json!(format!(
-                        "Judging from the path, metadata and `content_head` of `files.{id}`, does that file satisfy `query`?"
-                    )),
-                    criteria: match_criteria(),
-                },
+                Question::Noul { instructions: json!(format!("Does `files.{id}` satisfy `query`?")), criteria: None },
             )];
             if !ctx.classify.is_empty() {
                 v.push((
@@ -396,11 +431,11 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
                     },
                 ));
             }
-            if let Some(r) = &ctx.args.rank {
+            if ctx.args.rank.is_some() {
                 v.push((
                     "rank",
                     Question::Score {
-                        instructions: json!({ "aspect": r, "question": format!("Rate `files.{id}` on `aspect`.") }),
+                        instructions: json!(format!("Rate `files.{id}` on `aspect`.")),
                         criteria: ctx.args.levels.iter().map(|s| json!(s)).collect(),
                     },
                 ));
@@ -408,6 +443,40 @@ fn questions(ctx: &Ctx, kind: Kind, id: &str) -> Vec<(&'static str, Question)> {
             v
         }
     }
+}
+
+/// state のうち、項目によらない部分(`query` と `task`、--rank の観点)
+fn shared_state(ctx: &Ctx, kind: Kind) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("query".into(), json!(ctx.args.query));
+    m.insert("task".into(), json!(task(kind)));
+    if let (Kind::Content, Some(r)) = (kind, &ctx.args.rank) {
+        m.insert("aspect".into(), json!(r));
+    }
+    m
+}
+
+/// ファイル項目の "path" を、バッチ内で共有するディレクトリ表への参照 "dir" と "name" に分ける
+fn split_paths(items: &mut serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut dirs = serde_json::Map::new();
+    for item in items.values_mut() {
+        let Some(m) = item.as_object_mut() else { continue };
+        let Some(Value::String(path)) = m.remove("path") else { continue };
+        let (dir, name) = path.rsplit_once('/').unwrap_or((".", &path));
+        let dir = if dir.is_empty() { "/" } else { dir };
+        let id = ids.entry(dir.to_string()).or_insert_with(|| {
+            let id = format!("p{}", dirs.len());
+            dirs.insert(id.clone(), json!(dir));
+            id
+        });
+        let mut out = serde_json::Map::new();
+        out.insert("dir".into(), json!(id));
+        out.insert("name".into(), json!(name));
+        out.extend(std::mem::take(m));
+        *m = out;
+    }
+    dirs
 }
 
 fn noul(a: Option<&Answer>) -> f64 {
@@ -512,7 +581,12 @@ async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>, permit:
         }
         items.insert(id, j.item.clone());
     }
-    let state = json!({ "query": ctx.args.query, coll: items });
+    let mut state = shared_state(&ctx, kind);
+    if !matches!(kind, Kind::Prune) {
+        state.insert("dirs".into(), Value::Object(split_paths(&mut items)));
+    }
+    state.insert(coll.into(), Value::Object(items));
+    let state = Value::Object(state);
     let mut answers = match ctx.ask(&state, &qs, permit).await {
         Ok(a) => a,
         // トークン上限超過やファイアウォールのブロック(特定ファイルの内容が原因)は、
@@ -765,7 +839,36 @@ fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(String, bool, bool)> {
     let truncated = buf.len() > n;
     buf.truncate(n);
     let binary = buf.iter().take(8192).any(|&b| b == 0);
-    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated, binary))
+    let text = if binary { String::new() } else { squeeze(&String::from_utf8_lossy(&buf), truncated) };
+    Ok((text, truncated, binary))
+}
+
+/// 意味を変えずにトークンを減らす: 行末の空白を落とし、連続する空行は1行にまとめ、
+/// 途中で切れた最後の行は捨てる(切れた単語や壊れた文字は判定の役に立たない)
+fn squeeze(text: &str, truncated: bool) -> String {
+    let body = match text.rfind('\n') {
+        Some(i) if truncated && i >= text.len() / 2 => &text[..i],
+        _ => text,
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut blank = false;
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if blank || out.is_empty() {
+                continue;
+            }
+            blank = true;
+        } else {
+            blank = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !body.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 async fn eval_file(ctx: Arc<Ctx>, f: FileEntry, hits: mpsc::Sender<Hit>) {
