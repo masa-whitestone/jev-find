@@ -25,9 +25,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -243,7 +242,7 @@ struct Ctx {
     args: Args,
     jev: jev::Client,
     cache: cache::Cache,
-    api: Semaphore,
+    api: Arc<Semaphore>,
     fsem: Semaphore,
     excludes: GlobSet,
     exts: Vec<String>,
@@ -266,8 +265,14 @@ impl std::fmt::Display for BudgetExhausted {
 impl std::error::Error for BudgetExhausted {}
 
 impl Ctx {
-    /// 1リクエストを送る(予算と同時実行数の管理つき)。キャッシュは judge 側で項目単位に持つ
-    async fn ask(&self, state: &Value, qs: &BTreeMap<String, Question>) -> Result<BTreeMap<String, Answer>> {
+    /// 1リクエストを送る(予算と同時実行数の管理つき)。キャッシュは judge 側で項目単位に持つ。
+    /// `permit` はバッチを組む前に取った同時実行枠(なければここで取る)
+    async fn ask(
+        &self,
+        state: &Value,
+        qs: &BTreeMap<String, Question>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<BTreeMap<String, Answer>> {
         if self.stopped() {
             return Err(BudgetExhausted.into());
         }
@@ -277,7 +282,10 @@ impl Ctx {
             self.stop.store(true, Relaxed);
             return Err(BudgetExhausted.into());
         }
-        let _permit = self.api.acquire().await?;
+        let _permit = match permit {
+            Some(p) => p,
+            None => self.api.clone().acquire_owned().await?,
+        };
         let (a, u) = self.jev.evaluate(state, qs).await?;
         self.st.in_tok.fetch_add(u.input_tokens, Relaxed);
         self.st.out_tok.fetch_add(u.output_tokens, Relaxed);
@@ -444,14 +452,32 @@ impl Pools {
     }
 }
 
-/// 最初の1件が来てから最大 30ms、または size 件たまるまで待って1バッチにする
+/// バッチを組むときに、次の1件をこれ以上待たない間隔
+const BATCH_IDLE: Duration = Duration::from_millis(3);
+/// 最初の1件から送信までの最長の待ち
+const BATCH_LINGER: Duration = Duration::from_millis(30);
+
+/// 適応的なバッチ化:
+/// - 先に API の同時実行枠を取ってからバッチを組む。枠が埋まっている間は項目が列にたまり、
+///   空いた瞬間にまとめて大きなバッチで送る(混んでいるほどバッチが大きくなる)
+/// - 枠が空いていれば、項目の流れが BATCH_IDLE 途切れた時点ですぐ送る(固定の待ち時間を払わない)
 async fn run_pool(ctx: Arc<Ctx>, kind: Kind, mut rx: mpsc::Receiver<Job>, size: usize) {
     let size = size.max(1);
     while let Some(j) = rx.recv().await {
+        let Ok(permit) = ctx.api.clone().acquire_owned().await else { return };
         let mut batch = vec![j];
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let deadline = tokio::time::Instant::now() + BATCH_LINGER;
         while batch.len() < size {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
+            match rx.try_recv() {
+                Ok(j) => {
+                    batch.push(j);
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            let idle = (tokio::time::Instant::now() + BATCH_IDLE).min(deadline);
+            match tokio::time::timeout_at(idle, rx.recv()).await {
                 Ok(Some(j)) => batch.push(j),
                 _ => break,
             }
@@ -459,7 +485,7 @@ async fn run_pool(ctx: Arc<Ctx>, kind: Kind, mut rx: mpsc::Receiver<Job>, size: 
         if ctx.stopped() {
             continue; // reply を落とすと待ち手には Fail::Failed が返る
         }
-        tokio::spawn(run_batch(ctx.clone(), kind, batch));
+        tokio::spawn(run_batch(ctx.clone(), kind, batch, Some(permit)));
     }
 }
 
@@ -468,11 +494,11 @@ fn splittable(e: &anyhow::Error) -> bool {
     s.contains("max_tokens_exceeded") || s.starts_with("HTTP 403") || s.starts_with("HTTP 413")
 }
 
-fn run_batch(ctx: Arc<Ctx>, kind: Kind, batch: Vec<Job>) -> BoxFut {
-    Box::pin(run_batch_inner(ctx, kind, batch))
+fn run_batch(ctx: Arc<Ctx>, kind: Kind, batch: Vec<Job>, permit: Option<OwnedSemaphorePermit>) -> BoxFut {
+    Box::pin(run_batch_inner(ctx, kind, batch, permit))
 }
 
-async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
+async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>, permit: Option<OwnedSemaphorePermit>) {
     let (coll, prefix) = match kind {
         Kind::Prune => ("directories", "d"),
         Kind::Meta | Kind::Content => ("files", "f"),
@@ -487,14 +513,14 @@ async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
         items.insert(id, j.item.clone());
     }
     let state = json!({ "query": ctx.args.query, coll: items });
-    let mut answers = match ctx.ask(&state, &qs).await {
+    let mut answers = match ctx.ask(&state, &qs, permit).await {
         Ok(a) => a,
         // トークン上限超過やファイアウォールのブロック(特定ファイルの内容が原因)は、
         // 半分に割って送り直す。原因の1件だけが最後に落ちる
         Err(e) if batch.len() > 1 && splittable(&e) => {
             let second = batch.split_off(batch.len() / 2);
-            tokio::spawn(run_batch(ctx.clone(), kind, second));
-            return run_batch(ctx, kind, batch).await;
+            tokio::spawn(run_batch(ctx.clone(), kind, second, None));
+            return run_batch(ctx, kind, batch, None).await;
         }
         // 1件まで絞っても遮断される → そのファイルの内容が原因。呼び出し側で名前だけの判定に切り替える
         Err(e) if format!("{e:#}").starts_with("HTTP 403") => {
@@ -511,14 +537,17 @@ async fn run_batch_inner(ctx: Arc<Ctx>, kind: Kind, mut batch: Vec<Job>) {
             return ctx.report(&what, e);
         }
     };
-    for (i, j) in batch.into_iter().enumerate() {
-        let pre = format!("{prefix}{i}_");
-        let keys: Vec<String> = answers.keys().filter(|k| k.starts_with(&pre)).cloned().collect();
-        let mine: BTreeMap<String, Answer> = keys
-            .into_iter()
-            .filter_map(|k| answers.remove(&k).map(|a| (k[pre.len()..].to_string(), a)))
-            .collect();
-        ctx.cache.put(&j.key, &mine).await;
+    // 答えのキーは "{id}_{質問名}"。id ごとに振り分ける
+    let mut per: Vec<BTreeMap<String, Answer>> = (0..batch.len()).map(|_| BTreeMap::new()).collect();
+    for (k, a) in std::mem::take(&mut answers) {
+        let Some((id, q)) = k.split_once('_') else { continue };
+        let Some(i) = id.strip_prefix(prefix).and_then(|n| n.parse::<usize>().ok()) else { continue };
+        if let Some(m) = per.get_mut(i) {
+            m.insert(q.to_string(), a);
+        }
+    }
+    ctx.cache.put_many(batch.iter().zip(&per).map(|(j, m)| (j.key.as_str(), m))).await;
+    for (j, mine) in batch.into_iter().zip(per) {
         let _ = j.reply.send(Ok(mine));
     }
 }
@@ -572,9 +601,27 @@ fn age_days(now: u64, mtime: u64) -> f64 {
     (now.saturating_sub(mtime) as f64 / 86400.0 * 10.0).round() / 10.0
 }
 
-fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) -> BoxFut {
+/// 枝刈りの判定結果を待つための札。None = 判定待ち、Some(true) = 降りてよい
+type Gate = watch::Receiver<Option<bool>>;
+
+fn open_gate() -> Gate {
+    watch::channel(Some(true)).1
+}
+
+/// 判定が出るまで待つ。判定役がいなくなったら降りる側に倒す (fail-open)
+async fn pass(g: &mut Gate) -> bool {
+    match g.wait_for(|v| v.is_some()).await {
+        Ok(v) => v.unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// `parent` は親ディレクトリの枝刈り判定。親の判定を待たずに自分の一覧と枝刈りの問い合わせを
+/// 先に始め(1段だけ先読み)、親が「降りない」と決めたらそこで捨てる。
+/// 深い木でも「1段ごとに API の往復を1回待つ」直列の連鎖にならない
+fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>, mut parent: Gate) -> BoxFut {
     Box::pin(async move {
-        if ctx.stopped() {
+        if ctx.stopped() || *parent.borrow() == Some(false) {
             return;
         }
         let listing = {
@@ -599,33 +646,43 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
             ctx.st.ignored.fetch_add(1, Relaxed);
             return;
         }
-        ctx.st.dirs.fetch_add(1, Relaxed);
 
-        // 意味的枝刈り: 読んだ一覧をそのまま使う(追加のI/Oなし)
-        if ctx.args.prune && depth >= ctx.args.prune_min_depth {
+        // 意味的枝刈り: 読んだ一覧をそのまま使う(追加のI/Oなし)。答えは待たずに先へ進む
+        let mut gate = if ctx.args.prune && depth >= ctx.args.prune_min_depth {
             let sample: Vec<String> = listing
                 .iter()
                 .take(60)
                 .map(|e| if e.is_dir { format!("{}/", e.name) } else { e.name.clone() })
                 .collect();
             let item = json!({ "path": show(&dir), "entry_count": listing.len(), "sample_entries": sample });
-            match ctx.judge(Kind::Prune, item).await {
-                Ok(a) => {
-                    let p = noul(a.get("dir"));
-                    if p < ctx.args.prune_threshold {
-                        ctx.st.pruned.fetch_add(1, Relaxed);
-                        if ctx.args.verbose {
-                            eprintln!("jfd: prune {:.2} {}", p, show(&dir));
+            let (tx, rx) = watch::channel(None);
+            let c = ctx.clone();
+            let d = dir.clone();
+            tokio::spawn(async move {
+                let keep = match c.judge(Kind::Prune, item).await {
+                    Ok(a) => {
+                        let p = noul(a.get("dir"));
+                        if p < c.args.prune_threshold && c.args.verbose {
+                            eprintln!("jfd: prune {:.2} {}", p, show(&d));
                         }
-                        return;
+                        p >= c.args.prune_threshold
                     }
-                }
-                Err(_) if ctx.stopped() => return,
-                Err(_) => {} // fail-open: 判定できなければ降りる
-            }
+                    Err(_) => !c.stopped(), // fail-open: 判定できなければ降りる
+                };
+                tx.send_replace(Some(keep));
+            });
+            rx
+        } else {
+            open_gate()
+        };
+
+        // 親が降りると決めるまでは子に手を付けない(先読みは1段だけ)
+        if !pass(&mut parent).await {
+            return;
         }
 
-        let mut files = JoinSet::new();
+        let mut subdirs = Vec::new();
+        let mut files_here = Vec::new();
         for e in listing {
             if !ctx.args.hidden && e.name.starts_with('.') {
                 continue;
@@ -638,7 +695,7 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
                 if ctx.ignored_dir(&path, &e.name) {
                     ctx.st.ignored.fetch_add(1, Relaxed);
                 } else if ctx.args.max_depth.map_or(true, |m| depth + 1 < m) {
-                    tokio::spawn(walk_dir(ctx.clone(), path, depth + 1, hits.clone()));
+                    subdirs.push(path);
                 }
             } else if e.is_file {
                 if !ctx.exts.is_empty() {
@@ -653,9 +710,23 @@ fn walk_dir(ctx: Arc<Ctx>, dir: PathBuf, depth: usize, hits: mpsc::Sender<Hit>) 
                 if ctx.args.max_size.is_some_and(|m| e.size > m) {
                     continue;
                 }
-                let f = FileEntry { path, size: e.size, mtime: e.mtime };
-                files.spawn(eval_file(ctx.clone(), f, hits.clone()));
+                files_here.push(FileEntry { path, size: e.size, mtime: e.mtime });
             }
+        }
+        // 子ディレクトリは自分の判定を待たずに走らせる(子は自分の判定が出るまでファイルに手を付けない)
+        for path in subdirs {
+            tokio::spawn(walk_dir(ctx.clone(), path, depth + 1, hits.clone(), gate.clone()));
+        }
+        if !pass(&mut gate).await {
+            if !ctx.stopped() {
+                ctx.st.pruned.fetch_add(1, Relaxed);
+            }
+            return;
+        }
+        ctx.st.dirs.fetch_add(1, Relaxed);
+        let mut files = JoinSet::new();
+        for f in files_here {
+            files.spawn(eval_file(ctx.clone(), f, hits.clone()));
         }
         while files.join_next().await.is_some() {}
     })
@@ -680,10 +751,17 @@ struct Hit {
     level: Option<String>,
 }
 
+/// tokio::fs だと open と read のたびにスレッドプールを往復するので、1回の spawn_blocking で済ませる
 async fn read_head(p: &Path, n: usize) -> Result<(String, bool, bool)> {
-    let f = tokio::fs::File::open(p).await?;
+    let p = p.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || read_head_sync(&p, n)).await??)
+}
+
+fn read_head_sync(p: &Path, n: usize) -> std::io::Result<(String, bool, bool)> {
+    use std::io::Read;
+    let f = std::fs::File::open(p)?;
     let mut buf = Vec::with_capacity(n.min(1 << 20) + 1);
-    f.take(n as u64 + 1).read_to_end(&mut buf).await?;
+    f.take(n as u64 + 1).read_to_end(&mut buf)?;
     let truncated = buf.len() > n;
     buf.truncate(n);
     let binary = buf.iter().take(8192).any(|&b| b == 0);
@@ -882,10 +960,12 @@ async fn main() -> Result<()> {
     let (prune_tx, prune_rx) = mpsc::channel(8192);
     let (meta_tx, meta_rx) = mpsc::channel(8192);
     let (content_tx, content_rx) = mpsc::channel(8192);
+    let started = Instant::now();
+    let jev = jev::Client::new(&base_url, key, model)?;
     let ctx = Arc::new(Ctx {
-        jev: jev::Client::new(&base_url, key, model)?,
+        jev,
         cache: cache::Cache::new(!args.no_cache),
-        api: Semaphore::new(jobs),
+        api: Arc::new(Semaphore::new(jobs)),
         fsem: Semaphore::new(128),
         excludes: gb.build()?,
         exts: args.exts.iter().map(|e| e.trim_start_matches('.').to_string()).collect(),
@@ -909,7 +989,7 @@ async fn main() -> Result<()> {
             let mtime = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
             tokio::spawn(eval_file(ctx.clone(), FileEntry { path: root, size: md.len(), mtime }, hit_tx.clone()));
         } else {
-            tokio::spawn(walk_dir(ctx.clone(), root, 0, hit_tx.clone()));
+            tokio::spawn(walk_dir(ctx.clone(), root, 0, hit_tx.clone(), open_gate()));
         }
     }
     drop(hit_tx); // 全ウォーカーとファイル判定が終わると hit_rx が閉じる
@@ -943,6 +1023,7 @@ async fn main() -> Result<()> {
             s.files.load(Relaxed), s.meta_decided.load(Relaxed), s.deep.load(Relaxed), s.blocked.load(Relaxed),
             s.requests.load(Relaxed), s.cache_hits.load(Relaxed), s.errors.load(Relaxed),
         );
+        eprintln!("elapsed={:.3}s", started.elapsed().as_secs_f64());
         eprintln!(
             "tokens in={} out={}  est. cost ≈ ${:.5} (at $0.042 / 1M input tokens)",
             tin, s.out_tok.load(Relaxed), tin as f64 * 0.042 / 1e6
